@@ -3,26 +3,14 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
-use embassy_stm32::dac::{DacCh1, ValueArray};
-use embassy_time::Timer;
-use embassy_stm32::i2c::I2c;
-use embassy_stm32::gpio::{ Level, Output, Speed };
-use embassy_stm32::{ bind_interrupts, i2c, peripherals, time::Hertz};
-use si5351;
-use si5351::{ Si5351, Si5351Device };
+use embassy_stm32::dac::{Dac, ValueArray};
+use embassy_stm32::dma::NoDma;
+use embassy_stm32::pac::timer::vals::Mms;
+use embassy_stm32::rcc::frequency;
+use embassy_stm32::timer::low_level;
+use embassy_stm32::{ peripherals, time::Hertz};
 use defmt_rtt as _;
 use panic_probe as _;
-
-bind_interrupts!(struct Irqs {
-    I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
-    I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
-});
-
-enum Direction {
-    Up,
-    Down,
-}
 
 use micromath::F32Ext;
 
@@ -38,63 +26,54 @@ fn to_sine_wave(v: u8) -> u8 {
     }
 }
 
+fn calculate_array<const N: usize>() -> [u8; N] {
+    let mut res = [0; N];
+    let mut i = 0;
+    while i < N {
+        res[i] = to_sine_wave(i as u8);
+        i += 1;
+    }
+    res
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner){
     info!("Hello world");
 
     let p = embassy_stm32::init(Default::default());
-    let bus = p.I2C1;
-    let sda = p.PB7;
-    let scl = p.PA15;
-    let mut led = Output::new(p.PC6, Level::High, Speed::Low);
-    let mut dac = DacCh1::new(p.DAC1, p.DMA1_CH3, p.PA4);
-    let mut buf = [0; 255];
-    for v in 0..255 {
-        buf[v] = to_sine_wave(v.try_into().unwrap());
-    }
 
-    let i2c = I2c::new(
-        bus, 
-        scl,
-        sda,
-        Irqs,
-        p.DMA1_CH1,
-        p.DMA1_CH2,
-        Hertz(100_000),
-        Default::default(),
+    info!("Initialising dac");
+    let dma = p.DMA1_CH1;
+    let (mut dac_ch1, mut dac_ch2) = Dac::new(p.DAC1, dma, NoDma, p.PA4, p.PA5).split();
+    //let mut dac = DacCh1::new(p.DAC1, p.DMA1_CH3, p.PA4);
+    let buf : &[u8; 128] = &calculate_array::<128>();
+    dac_ch1.set_trigger(embassy_stm32::dac::TriggerSel::Tim6);
+    dac_ch1.set_triggering(true);
+    dac_ch1.enable();
+    dac_ch2.disable();
+
+    // initialising timer
+    info!("Timer frequency: {}", frequency::<peripherals::TIM6>());
+    let tim = low_level::Timer::new(p.TIM6);
+    const FREQ: Hertz = Hertz::hz(10);
+    let reload = (frequency::<peripherals::TIM6>().0 / FREQ.0) / buf.len() as u32;
+    tim.regs_basic().arr().modify(|w| w.set_arr(reload as u16 - 1)); // set auto reload reg
+    tim.regs_basic().cr2().modify(|w| w.set_mms(Mms::UPDATE));
+    tim.regs_basic().cr1().modify(|w| {
+        w.set_opm(false);
+        w.set_cen(true);
+    });
+
+    info!("TIM frequency {}, target frequency {}, reload {}, reload as u16 {}, samples {}",
+        frequency::<peripherals::TIM6>(),
+        FREQ,
+        reload,
+        reload as u16,
+        buf.len(),
     );
 
-    let mut clock = Si5351Device::new(i2c, false, 25_000_000);
-    clock.init(si5351::CrystalLoad::_10).expect("clock init failed");
-
-    let dac_stuff = async {
-        dac.write(ValueArray::Bit8(&buf), true).await;
-    };
-
-    let pll_stuff = async {
-        let mut dir = Direction::Up;
-        let mut freq = 100_000;
-      
-        loop {
-            led.toggle();
-            info!("Setting frequency to {}", freq);
-            clock.set_frequency(si5351::PLL::A, si5351::ClockOutput::Clk0, freq).expect("set frequency failed");
-            let status = clock.read_device_status().expect("Failed to read status");
-            info!("Status: {:#b}", status.bits());
-    
-            match freq {
-                100_000 => dir = Direction::Up,
-                200_000 => dir = Direction::Down,
-                _ => (),
-            };
-            match dir {
-                Direction::Up => freq += 10_000,
-                Direction::Down => freq -= 10_000,
-            };
-    
-            Timer::after_millis(1000).await;
-        }
-    };
-
-    join(pll_stuff, dac_stuff).await;
+    loop {
+        info!("Writing DAC");
+        dac_ch1.write(ValueArray::Bit8(buf), false).await;
+    }
 }
